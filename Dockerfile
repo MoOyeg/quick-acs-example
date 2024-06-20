@@ -42,4 +42,4 @@ RUN chmod -R g+rw ./
 USER 1001
 
 #ENTRY
-ENTRYPOINT gunicorn run:app --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8080
+ENTRYPOINT python3.10 app.py

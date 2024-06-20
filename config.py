@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     
     #Health Check Retry Delay in Seconds
     health_check_retry_delay:int = os.environ.get('HEALTH_CHECK_RETRY_DELAY') or 5
+    
+    #Poll Disabled Policy Information
+    poll_disabled_policy_info:bool = os.environ.get('POLL_DISABLED_POLICY_INFO') or False
+    
+    #Output folder for the Policy output
+    output_folder:str = os.environ.get('OUTPUT_FOLDER') or 'output'
 
 settings = Settings()
 
