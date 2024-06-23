@@ -3,7 +3,7 @@ from os import path, getenv
 from signal import SIGTERM
 from logging import getLogger, config
 from acs_request import get_acs_alert, get_rhacs_health,get_policy,get_alert_count,get_acs_deployment
-from pydantic import BaseModel, SecretStr, ValidationError, Field
+from pydantic import BaseModel, SecretStr, ValidationError, Field, field_serializer
 from pydantic_core import from_json
 from aiofiles import open as async_open, os as aiofiles_os
 from typing import Any, Optional, AsyncGenerator, Any
@@ -17,6 +17,9 @@ class ACSAlertCount(BaseModel):
     
 class ACSViolations(BaseModel):
     message: str
+    keyValueAttrs: Optional[dict] = None
+    type: Optional[str] = None
+    time: Optional[str] = None
 
 class ACSImageDetails(BaseModel):
     registry: Optional[str] = None
@@ -69,8 +72,15 @@ class ACSDeployment(BaseModel):
     stateTimestamp: Optional[str] = None
     ports:  Optional[list] = None
     #Fields below were added to help correlation
-    metadata_processed: Optional[bool] = False
+    metadata_processed: Optional[bool] = Field(default=False,exclude=True)
     alerts: Optional[list] = []
+
+class ACSDeploymentList(BaseModel):
+    '''App Object - List of Deployments obtained from RHACS'''
+    deployments: list[ACSDeployment]
+    
+    async def get_deployment_count(self):
+        return len(self.deployments)
 
 class ACSPolicy(BaseModel):
     '''Policy Information for Policy generating this Violation'''
@@ -84,7 +94,7 @@ class ACSPolicy(BaseModel):
     SORTName: Optional[str] = None
     SORTLifecycleStage: Optional[str] = None
     policyVersion: Optional[str] = None
-    policySections: Optional[dict] = None
+    policySections: Optional[list] = None
     description: Optional[str] = None
     rationale: Optional[str] = None
     remediation: Optional[str] = None
@@ -95,14 +105,14 @@ class ACSPolicy(BaseModel):
     categories: Optional[list] = None
     severity: Optional[str] = None
     enforcementActions: Optional[list] = None
-    mitreAttackVectors: Optional[str] = None
-    criteriaLocked: Optional[str] = None
-    mitreVectorsLocked: Optional[str] = None
+    mitreAttackVectors: Optional[list] = None
+    criteriaLocked: Optional[bool] = None
+    mitreVectorsLocked: Optional[bool] = None
     isDefault: Optional[bool] = None
     #Fields below were added to help correlation
     #Violation Count keeps track of number of alerts for this policy
     violation_count: Optional[int] = None
-    metadata_processed: Optional[bool] = False
+    metadata_processed: Optional[bool] = Field(default=False,exclude=True)
         
 class ACSPolicyList(BaseModel):
     '''App Object - List of Policies obtained from ACS'''
@@ -122,7 +132,7 @@ class ACSAlert(BaseModel):
     namespaceId:Optional[str] = None
     deployment: Optional[ACSDeployment] = None
     resource: Optional[dict] = None
-    violations: Optional[ACSViolations] = None
+    violations: Optional[list[ACSViolations]] = None
     time: str
     firstOccurred: Optional[str] = None
     lifecycleStage: Optional[str] = None
@@ -131,7 +141,7 @@ class ACSAlert(BaseModel):
     snoozeTill: Optional[str] = None
     enforcement: Optional[str] = None
     #Added below to help with correlation
-    metadata_processed: Optional[bool] = False
+    metadata_processed: Optional[bool] = Field(default=False,exclude=True)
 
 class ACSAlertList(BaseModel):
     '''App Object - List of Alerts obtained from RHACS'''
@@ -140,11 +150,24 @@ class ACSAlertList(BaseModel):
     async def get_alert_count(self):
         return len(self.alerts)
 
+class OCPNamespace(BaseModel):
+    '''Class For OCP Namespace Information'''
+    namespace_id: str
+    namespace_name: str
+    deployments: Optional [ACSDeploymentList] = None
+    alerts: Optional [ACSAlertList] = None
+    
+class OCPNamespaceList(BaseModel):
+    '''App Object - List of OCP Namespaces'''
+    namespaces: list[OCPNamespace]
+
 class OCPCluster(BaseModel):
     '''Class For OCP Cluster Information'''
     cluster_id: str
     cluster_name: str
-    deployments: list[ACSDeployment]
+    deployments: Optional [ACSDeploymentList] = None
+    namespaces: Optional [OCPNamespaceList] = None
+    alerts: Optional [ACSAlertList] = None
 
 class OCPClusterlist(BaseModel):
     '''App Object - List of OCP Clusters'''
@@ -156,7 +179,7 @@ class ACSEndpoint(BaseModel):
     endpoint_name: str
     endpoint_url: str
     endpoint_token_env_variable_name: str
-    endpoint_token: SecretStr = "Empty"
+    endpoint_token: SecretStr = Field(default="Empty",exclude=True)
     verify_endpoint_ssl: bool = False
     healthy: bool = False
     metadata_processed: Optional[bool] = False
@@ -164,7 +187,7 @@ class ACSEndpoint(BaseModel):
     endpoint_url_description: str = "ACS API endpoint for the application to make request to"
     endpoint_token_env_variable_name_description:str = "Environment Variable to retrieve the Token for this cluster"
     policies: ACSPolicyList = ACSPolicyList(policies=[])
-    
+        
     def get_health(self) -> bool:
         if not self.initialized:
             return False      
@@ -198,8 +221,10 @@ class ParsedMemory():
     alert_list: ACSAlertList = ACSAlertList(alerts=[])
     policy_list: ACSPolicyList = ACSPolicyList(policies=[])
     ocp_clusters: OCPClusterlist = OCPClusterlist(clusters=[])
-    deployment_list = []
+    namespace_list: OCPNamespaceList = OCPNamespaceList(namespaces=[])
+    deployment_list: ACSDeploymentList = ACSDeploymentList(deployments=[]) 
     map_cluster_id_cluster_object = {}
+    map_namespace_id_namespace_object = {}
     map_endpoint_uuid_endpoint_object = {}
     map_endpoint_uuid_policy_object = {}
     map_policy_id_alert_list = {}
@@ -308,10 +333,10 @@ class ParsedMemory():
             return cls._all_deployments_processed
         
         async with cls._lock:
-            if not len(cls.deployment_list) > 0:
+            if not await cls.deployment_list.get_deployment_count() > 0:
                 return False
             
-            for deployment in cls.deployment_list:
+            for deployment in cls.deployment_list.deployments:
                 if not deployment.metadata_processed:
                     return False
             cls._all_deployments_processed = True
@@ -327,7 +352,53 @@ class ParsedMemory():
                 if endpoint.get_health():
                     return False
             return True
-                             
+
+    @classmethod
+    async def check_namespace_exists_else_create(cls,namespace_id: str) -> OCPNamespace:
+        """_summary_
+
+        Args:
+            namespace_id (str): _description_
+
+        Returns:
+            _type_: _description_
+        """
+        if not cls._lock.locked():
+            raise Exception(f"Lock not acquired for {cls.check_namespace_exists_else_create.__name__} method") 
+                  
+        logger.debug(f"Check if Namespace with ID {namespace_id} exists in our data")
+        if namespace_id in cls.map_namespace_id_namespace_object.keys():
+            return cls.map_namespace_id_namespace_object[namespace_id]
+        else:
+            logger.debug(f"Namespace with ID {namespace_id} does not exist in our data, creating new Namespace")
+            new_namespace = OCPNamespace(namespace_id=namespace_id,namespace_name="",deployments=ACSDeploymentList(deployments=[]) ,alerts=ACSAlertList(alerts=[]))
+            cls.namespace_list.namespaces.append(new_namespace)
+            cls.map_namespace_id_namespace_object[namespace_id] = new_namespace
+            return new_namespace
+    
+    @classmethod
+    async def check_cluster_exists_else_create(cls,cluster_id: str) -> OCPCluster:
+        """_summary_
+
+        Args:
+            cluster_id (str): _description_
+
+        Returns:
+            _type_: _description_
+        """
+        if not cls._lock.locked():
+            raise Exception(f"Lock not acquired for {cls.check_cluster_exists_else_create.__name__} method") 
+                  
+        logger.debug(f"Check if Cluster with ID {cluster_id} exists in our data")
+        if cluster_id in cls.map_cluster_id_cluster_object.keys():
+            return cls.map_cluster_id_cluster_object[cluster_id]
+        else:
+            logger.debug(f"Cluster with ID {cluster_id} does not exist in our data, creating new Cluster")
+            new_cluster = OCPCluster(cluster_id=cluster_id,cluster_name="",deployments=ACSDeploymentList(deployments=[]) ,namespaces=OCPNamespaceList(namespaces=[]),alerts=ACSAlertList(alerts=[]))
+            cls.ocp_clusters.clusters.append(new_cluster)
+            cls.map_cluster_id_cluster_object[cluster_id] = new_cluster
+            return new_cluster
+                         
     @classmethod
     async def check_endpoint_valid_healthy(cls,ACS_Endpoint:ACSEndpoint):
         """
@@ -434,25 +505,38 @@ class ParsedMemory():
         return True
 
     @classmethod
-    async def append_alert(cls,ACSAlertList:ACSAlertList,ACSEndpoint:ACSEndpoint,ACSPolicy) -> bool:
+    async def append_alert(cls,ACSAlert:ACSAlert,ACSEndpoint:ACSEndpoint,ACSPolicy) -> bool:
         """
         Append Alert to the List
         """
         async with cls._lock:
             try:                            
-                cls.alert_list.alerts= cls.alert_list.alerts + ACSAlertList.alerts
-                cls.map_alert_id_endpoint_object.update({alert.id:ACSEndpoint for alert in ACSAlertList.alerts})  
+                cls.alert_list.alerts.append(ACSAlert)
+                cls.map_alert_id_endpoint_object.update({ACSAlert.id:ACSEndpoint})  
+
                 if ACSPolicy.id in cls.map_policy_id_alert_list.keys():
-                    cls.map_policy_id_alert_list[ACSPolicy.id].alerts = cls.map_policy_id_alert_list[ACSPolicy.id].alerts + ACSAlertList.alerts
-                else:
-                    cls.map_policy_id_alert_list[ACSPolicy.id] = ACSAlertList 
-                
-                for alert in ACSAlertList.alerts:
-                    alert.metadata_processed = True                    
-                    if alert.policy is not None:
-                        if alert.policy.id == ACSPolicy.id:
-                            #No need to maintain 2 policy objects with the same information
-                            alert.policy=ACSPolicy     
+                    cls.map_policy_id_alert_list[ACSPolicy.id].alerts.append(ACSAlert)
+ 
+                ACSAlert.metadata_processed = True
+                alert_namespace_object = None
+                    
+                if ACSAlert.namespaceId is not None:
+                    namespace = await cls.check_namespace_exists_else_create(ACSAlert.namespaceId)
+                    if namespace is not None:
+                        namespace.alerts.alerts.append(ACSAlert)
+                        alert_namespace_object = namespace
+                    
+                if ACSAlert.clusterId is not None:
+                    cluster = await cls.check_cluster_exists_else_create(ACSAlert.clusterId)
+                    if cluster is not None:
+                        cluster.alerts.alerts.append(ACSAlert)
+                        if alert_namespace_object is not None:
+                            cluster.namespaces.namespaces.append(alert_namespace_object)
+                                     
+                if ACSAlert.policy is not None:
+                    if ACSAlert.policy.id == ACSPolicy.id:
+                        #No need to maintain 2 policy objects with the same information
+                            ACSAlert.policy=ACSPolicy     
                 logger.debug(f"Alert appended to the list of Alerts")
             except Exception as e:
                 logger.error(f"Error: {e}")
@@ -467,19 +551,33 @@ class ParsedMemory():
         async with cls._lock:
             try:
                 ACSDeployment.alerts.append(ACSAlert)
-                cls.deployment_list.append(ACSDeployment)
-                if ACSDeployment.clusterId in cls.map_cluster_id_cluster_object.keys():
-                    cls.map_cluster_id_cluster_object[ACSDeployment.clusterId].deployments.append(ACSDeployment)
-                else:
-                    temp_cluster = OCPCluster(cluster_id=ACSDeployment.clusterId,cluster_name=ACSDeployment.clusterName,deployments=[ACSDeployment])
-                    cls.ocp_clusters.clusters.append(temp_cluster)
-                    cls.map_cluster_id_cluster_object[ACSDeployment.clusterId] = temp_cluster
+                cls.deployment_list.deployments.append(ACSDeployment)
+                namespace_object = None
+                
+                if ACSDeployment.namespaceId is not None:
+                    namespace = await cls.check_namespace_exists_else_create(ACSDeployment.namespaceId)
+                    if namespace is not None:
+                        namespace.deployments.deployments.append(ACSDeployment)
+                        namespace.namespace_name=ACSDeployment.namespace
+                        namespace_object = namespace
+                
+                if ACSDeployment.clusterId is not None:
+                    cluster = await cls.check_cluster_exists_else_create(ACSDeployment.clusterId)
+                    if cluster is not None:
+                        cluster.deployments.deployments.append(ACSDeployment)
+                        cluster.cluster_name=ACSDeployment.clusterName
+                    
+                    if namespace_object is not None:
+                        cluster.namespaces.namespaces.append(namespace_object)
+   
                 ACSDeployment.metadata_processed = True
                 logger.debug(f"Deployment appended to the list of Deployments")
             except Exception as e:
                 logger.error(f"Error: {e}")
                 return False
         return True
+    
+    
         
         
         
@@ -625,19 +723,43 @@ async def get_alerts_for_policy(ACSEndpoint:ACSEndpoint,ACSPolicy:ACSPolicy) -> 
     headers={"Authorization": f"Bearer {ACSEndpoint.endpoint_token}",
                  "Content-Type": "application/json"}
     
+    parsed_alert_list = []
     response_dict = await get_acs_alert(ACSEndpoint.endpoint_url,None,ACSEndpoint.verify_endpoint_ssl,headers,params)
     if "error_object" in response_dict and response_dict["error_object"] is not None:
         logger.error(f"Failed getting Alerts for Policy {ACSPolicy.name}")
         logger.error(f"Error: {response_dict['error_object']}")
         return
     try:
-        for alert in response_dict["response_object"]:
-            parsed_alert=ACSAlertList.model_validate_json(alert.text)
-            await ParsedMemory.append_alert(parsed_alert,ACSEndpoint,ACSPolicy)
+        if hasattr(response_dict["response_object"], '__iter__'):
+            for alert in response_dict["response_object"]:
+                parsed_alert=ACSAlertList.model_validate_json(alert.text)
+                parsed_alert_list.append(parsed_alert)
+                #await ParsedMemory.append_alert(parsed_alert,ACSEndpoint,ACSPolicy)
+        else:
+            parsed_alert=ACSAlertList.model_validate_json(response_dict["response_object"].text)
+            parsed_alert_list.append(parsed_alert)
+            #await ParsedMemory.append_alert(parsed_alert,ACSEndpoint,ACSPolicy)
     except ValidationError as e:
         logger.error(f"Error: {e}")
         logger.info("Content from file is not valid json for ASCSAlert")
         return
+    
+    for parsed_alert in parsed_alert_list:
+        for alert in parsed_alert.alerts:
+            response_dict = await get_acs_alert(ACSEndpoint.endpoint_url,alert.id,ACSEndpoint.verify_endpoint_ssl,headers,params)
+            if "error_object" in response_dict and response_dict["error_object"] is not None:
+                logger.error(f"Failed getting Alerts for Policy {ACSPolicy.name}")
+                logger.error(f"Error: {response_dict['error_object']}")
+                return
+            try:
+                new_parsed_alert=ACSAlert.model_validate_json(response_dict["response_object"].text)
+                await ParsedMemory.append_alert(new_parsed_alert,ACSEndpoint,ACSPolicy)
+            except ValidationError as e:
+                logger.error(f"Error: {e}")
+                logger.info("Content from file is not valid json for ASCSAlert")
+                return          
+                
+                
     
 async def get_deployment_metadata_for_alert(alert:ACSAlert,ACSEndpoint:ACSEndpoint) -> ACSDeployment:
     
@@ -718,7 +840,8 @@ async def continously_process_healthy_endpoints():
                 await asyncio.gather(*[get_alerts_for_policy(polled_endpoint,policy) 
                                        for policy in polled_endpoint.policies.policies 
                                        if policy.violation_count != 0 #There is no need to get alerts for policies we already know have no alerts
-                                       and policy.violation_count is not None #There is no need to get alerts for policies we have no alert count for(We are prob still waiting for the alert count to be updated due to async)
+                                    
+                                       #and policy.violation_count is not None #There is no need to get alerts for policies we have no alert count for(We are prob still waiting for the alert count to be updated due to async)
                                        and policy.id not in ParsedMemory.map_policy_id_alert_list.keys()]) #There is no need to get alerts for policies we have already gotten alerts for
                     
         #Obtain Deployment Information/Metadata for Alerts
@@ -729,13 +852,91 @@ async def continously_process_healthy_endpoints():
                 logger.debug(f"Alert {alert.id} does not have deployment information")
                 alert.metadata_processed = True             
 
-async def generate_cluster_deployment_output():
+async def generate_cluster_namespace_deployment_alert_output_file():
     """
     Generate the output for the Cluster and Deployment
     """
     logger.info("Generating Output for Cluster and Deployment")
-    output_content = ParsedMemory.ocp_clusters.model_dump_json(indent=4)
-    output_file = path.join(settings.output_folder, 'cluster_deployment_output.json')
+
+    exclude_keys = {
+    "clusters": {
+        '__all__': {
+            "deployments" : True
+            ,"alerts": True
+            ,"namespaces": {
+                "namespaces":{
+                    '__all__': {
+                        "alerts": True
+                        ,"deployments":
+                            {"deployments":
+                                {"__all__":{
+                                    "annotations": True
+                                    ,"imagePullSecrets": True
+                                    ,"serviceAccount": True
+                                    ,"annotations": True
+                                    ,"created": True
+                                    ,"labels" : True
+                                    ,"tolerations": True
+                                    ,"ports": True
+                                    ,"inactive" : True
+                                    ,"priority" : True
+                                    ,"stateTimestamp": True
+                                    ,"alerts": {
+                                        "__all__": {
+                                            "deployment": True 
+                                            ,"policy": {
+                                                "lifecycleStages" : True
+                                                ,"notifiers" : True
+                                                
+                                            }
+                                            }
+                                    }
+                                    ,"containers" : {
+                                        "__all__": {
+                                            "config": True
+                                            ,"securityContext": True
+                                            ,"volumes": True
+                                            ,"secrets": True
+                                            ,"ports": True
+                                            ,"resources": True
+                                            ,"livenessProbe": True
+                                            ,"readinessProbe": True
+                                        }
+                                    }
+                                    }
+                                 }
+                                }
+                            }
+                    }
+                }
+            } 
+        },    
+}
+    
+    output_content = ParsedMemory.ocp_clusters.model_dump_json(
+        exclude=exclude_keys,exclude_none=True,indent=4)
+    
+    output_file = path.join(settings.output_folder, 'cluster_namespace_deployment_alert_output_file.json')
+    await write_output_file(output_file, output_content)
+
+async def generate_endpoint_policy_alert_count_output_file():
+    """
+    Generate the output for the Policy Alert Count
+    """
+    logger.info("Generating Output for Policy Alert Count")
+    
+    include_keys = {
+        "endpoints": {
+            "__all__": {
+                "endpoint_name": True
+                ,"endpoint_url": True
+                ,"policies": {"policies": {"__all__": {"name": True,"severity": True,"description": True,"disabled": True,"eventSource": True,"violation_count": True}}}
+            }
+        }
+    }
+
+    output_content = ParsedMemory.endpoint_list.model_dump_json(include=include_keys,indent=4)
+    output_file = path.join(settings.output_folder, 'endpoint_policy_alert_count_output_file.json')
     await write_output_file(output_file, output_content)
            
 async def main():
@@ -758,7 +959,9 @@ async def main():
     #Generate output Files
     while True:
         if ParsedMemory.all_metadata_processed:
-            await generate_cluster_deployment_output()
+            logger.info("Generating Output Files")
+            await generate_cluster_namespace_deployment_alert_output_file()
+            await generate_endpoint_policy_alert_count_output_file()
             break
         else:
             logger.info("Waiting for all data to be processed before generating output")

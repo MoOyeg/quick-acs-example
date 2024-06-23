@@ -5,7 +5,7 @@
 
 - The list of endpoints for the app to poll can be set via ENDPOINT_LIST_JSON_PATH environment variable. The environment variable should point to a json file with API details. A sample file is provided in [endpoint_list.json](./endpoint_list.json).While environment details are provided via the previously mentioned variable the token used for connection is obtained via enviroment variable. And the token environment variable must be set in the endpoint json file and defined by field "endpoint_token_env_variable_name".
 
-- At the moment the app is set out to generate a single output of file with the list of clusters, their deployments and alerts.
+- Generate's sample output files in output folder, but can be customized for other use cases.
 
 Run Locally 
 - Build Image 

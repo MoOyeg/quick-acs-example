@@ -132,7 +132,7 @@ async def request_processing(full_url_path,insecure:bool=False,headers:dict=None
     if params is None:
         response_dict = await make_request(full_url_path,insecure,headers,params)
     else:
-        if "pagination.limit" in params:
+        if "pagination.limit" in params and "total_expected_count" in params:
             response_dict = await request_processing_pagination(full_url_path,insecure,headers,params)
         else:
             response_dict = await make_request(full_url_path,insecure,headers,params)      
